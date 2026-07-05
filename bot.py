@@ -61,6 +61,31 @@ def save_config(cfg: dict) -> None:
 
 CONFIG = load_config()
 AWAITING_THUMB = set()  # user ids that just ran /setthumb and need to send a photo
+REPOST_QUEUE = asyncio.Queue()  # FIFO of (client, message) awaiting repost
+WORKER_TASK = None
+
+
+def ensure_worker() -> None:
+    """Start (or restart after a crash) the single FIFO repost worker."""
+    global WORKER_TASK
+    if WORKER_TASK is None or WORKER_TASK.done():
+        WORKER_TASK = asyncio.get_running_loop().create_task(repost_worker())
+
+
+async def repost_worker() -> None:
+    """Process queued reposts one at a time, in arrival order."""
+    while True:
+        client, message = await REPOST_QUEUE.get()
+        try:
+            await process_repost(client, message)
+        except Exception:
+            log.exception("Repost failed for message %s", message.id)
+            try:
+                await message.reply_text("❌ Something went wrong reposting this file.")
+            except Exception:
+                pass
+        finally:
+            REPOST_QUEUE.task_done()
 
 
 def user_cfg(user_id: int) -> dict:
@@ -246,7 +271,7 @@ def build_app() -> Client:
         api_hash=api_hash,
         bot_token=bot_token,
         workdir=BASE_DIR,
-        max_concurrent_transmissions=4,  # parallel chunks for large-file transfer speed
+        max_concurrent_transmissions=8,  # parallel chunks for large-file transfer speed
     )
 
     @app.on_message(filters.command(["start", "help"]) & filters.private)
@@ -388,31 +413,15 @@ def build_app() -> Client:
             await store_thumbnail(message, message, client)
             return
 
-        cfg = user_cfg(message.from_user.id)
-        if not cfg["target_chat_id"]:
-            await message.reply_text("No target channel configured. Use /settarget first.")
-            return
-
-        ok, err = await verify_admin(client, cfg["target_chat_id"])
-        if not ok:
-            await message.reply_text(f"❌ Can't post to {cfg['target_title']}: {err}")
-            return
-
-        final_caption = build_caption(message.caption or "", cfg)
-
-        try:
-            if message.video and cfg.get("thumb_path"):
-                await repost_video_with_thumb(client, message, cfg, final_caption)
-            else:
-                await client.copy_message(
-                    chat_id=cfg["target_chat_id"],
-                    from_chat_id=message.chat.id,
-                    message_id=message.id,
-                    caption=final_caption,
-                )
-                await message.reply_text(f"✅ Posted to {cfg['target_title']}.")
-        except RPCError as e:
-            await message.reply_text(f"❌ Telegram rejected the post: {e}")
+        # Enqueue synchronously (no awaits before this point past the thumbnail
+        # check) so reposts happen strictly in the order files were forwarded —
+        # a quick copy_message must not overtake a large video ahead of it.
+        REPOST_QUEUE.put_nowait((client, message))
+        if REPOST_QUEUE.qsize() > 1:
+            await message.reply_text(
+                f"🕐 Queued (position {REPOST_QUEUE.qsize()}) — posting in order."
+            )
+        ensure_worker()
 
     @app.on_message(filters.private & filters.text & ~filters.command([
         "start", "help", "setkeywords", "clearkeywords", "setcaption", "clearcaption",
@@ -422,6 +431,35 @@ def build_app() -> Client:
         await message.reply_text("Send me a video, photo or document to repost, or /help for commands.")
 
     return app
+
+
+async def process_repost(client: Client, message: Message) -> None:
+    """Repost one forwarded media message to the user's target channel."""
+    cfg = user_cfg(message.from_user.id)
+    if not cfg["target_chat_id"]:
+        await message.reply_text("No target channel configured. Use /settarget first.")
+        return
+
+    ok, err = await verify_admin(client, cfg["target_chat_id"])
+    if not ok:
+        await message.reply_text(f"❌ Can't post to {cfg['target_title']}: {err}")
+        return
+
+    final_caption = build_caption(message.caption or "", cfg)
+
+    try:
+        if message.video and cfg.get("thumb_path"):
+            await repost_video_with_thumb(client, message, cfg, final_caption)
+        else:
+            await client.copy_message(
+                chat_id=cfg["target_chat_id"],
+                from_chat_id=message.chat.id,
+                message_id=message.id,
+                caption=final_caption,
+            )
+            await message.reply_text(f"✅ Posted to {cfg['target_title']}.")
+    except RPCError as e:
+        await message.reply_text(f"❌ Telegram rejected the post: {e}")
 
 
 class ProgressReporter:
