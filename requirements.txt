@@ -1,2 +1,2 @@
-pyrogram~=2.0
+kurigram~=2.2
 tgcrypto~=1.2
