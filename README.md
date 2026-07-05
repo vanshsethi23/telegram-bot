@@ -93,15 +93,13 @@ two processes sharing a bot token fight over updates and both misbehave.
 - **Private channels:** bots can't join via invite links. Add the bot as admin
   yourself, then use the channel's numeric id (`-100...`) with `/settarget`
   (forward a post from the channel to @userinfobot to find the id).
-- **Thumbnail replacement** reuses the video's existing `file_id` and only
-  uploads the small new thumbnail image — the video itself is never
-  downloaded or re-uploaded, so there's no meaningful size limit and it's as
-  fast as a caption-only repost. This changes the thumbnail Telegram displays
-  everywhere, but not the thumbnail embedded inside the video file's own
-  container (irrelevant unless someone downloads the raw file and opens it
-  outside Telegram).
-- Files without a thumbnail change use `copy_message`, which also never
-  downloads the file — captions/keywords can be edited on files of any size.
+- **Thumbnail replacement** requires downloading and re-uploading the video —
+  Telegram ignores a new thumbnail when a video is sent by reusing its
+  `file_id`, so there is no shortcut. Since the bot talks MTProto directly
+  (not the restricted Bot API), this works up to Telegram's own ~2 GB upload
+  ceiling, with live progress shown while it transfers.
+- Files without a thumbnail change use `copy_message`, which never downloads
+  the file — captions/keywords can be edited on files of any size instantly.
 - Reposts are processed strictly in the order they were forwarded (a FIFO
   queue), so a queued file never jumps ahead of one forwarded earlier.
 - Thumbnails are auto-converted to Telegram's requirements (JPEG, ≤ 320 px).

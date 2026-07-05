@@ -33,8 +33,10 @@ log = logging.getLogger("repost-bot")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 THUMB_DIR = os.path.join(BASE_DIR, "thumbnails")
+DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
 
 CAPTION_LIMIT = 1024  # Telegram caption limit (chars)
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # Telegram's own upload ceiling (2 GB, non-premium)
 THUMB_MAX_SIDE = 320  # Telegram thumbnail requirement
 
 VALID_MODES = ("append", "prepend", "replace")
@@ -132,6 +134,27 @@ def build_caption(original: str, cfg: dict) -> str:
 
 def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
+
+
+def attach_thumbnail(video_path: str, thumb_path: str, out_path: str) -> bool:
+    """Embed thumb as attached_pic via stream copy (no transcode). True on success."""
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-i", video_path, "-i", thumb_path,
+        "-map", "0", "-map", "1",
+        "-c", "copy",
+        "-disposition:v:1", "attached_pic",
+        out_path,
+    ]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        log.warning("ffmpeg failed: %s", e)
+        return False
+    if res.returncode != 0:
+        log.warning("ffmpeg failed: %s", res.stderr.strip())
+        return False
+    return True
 
 
 def make_telegram_thumb(src_path: str, out_path: str) -> bool:
@@ -439,39 +462,98 @@ async def process_repost(client: Client, message: Message) -> None:
         await message.reply_text(f"❌ Telegram rejected the post: {e}")
 
 
+class ProgressReporter:
+    """Throttled progress editor so long transfers show visible movement."""
+
+    def __init__(self, note: Message, label: str):
+        self.note = note
+        self.label = label
+        self._last_edit = 0.0
+        self._last_pct = -1
+
+    async def __call__(self, current: int, total: int) -> None:
+        pct = int(current * 100 / total) if total else 0
+        now = asyncio.get_running_loop().time()
+        if pct == self._last_pct or (now - self._last_edit < 4 and pct < 100):
+            return
+        self._last_edit = now
+        self._last_pct = pct
+        mb = lambda n: n / 1024 / 1024
+        try:
+            await self.note.edit_text(
+                f"⏳ {self.label}… {pct}% ({mb(current):.0f}/{mb(total):.0f} MB)"
+            )
+        except RPCError:
+            pass  # ignore flood-wait/edit races, the transfer itself is unaffected
+
+
 async def repost_video_with_thumb(
     client: Client, message: Message, cfg: dict, caption: str
 ) -> None:
-    """Repost a video with a new displayed thumbnail, reusing its existing
-    file_id so the video content itself is never downloaded or re-uploaded -
-    only the small thumbnail image is sent. This changes the thumbnail
-    Telegram displays everywhere, but does not alter the video file's own
-    embedded container thumbnail."""
+    """Download video, embed the configured thumbnail without transcoding, upload."""
     video = message.video
     target = cfg["target_chat_id"]
-    try:
+
+    async def copy_without_thumb(reason: str) -> None:
+        await client.copy_message(
+            chat_id=target, from_chat_id=message.chat.id,
+            message_id=message.id, caption=caption,
+        )
+        await message.reply_text(
+            f"⚠️ Posted to {cfg['target_title']} with the original thumbnail: {reason}"
+        )
+
+    if video.file_size and video.file_size > MAX_FILE_SIZE:
+        await copy_without_thumb(
+            f"this {video.file_size / 1024 / 1024:.0f} MB video exceeds Telegram's "
+            "own upload limit for thumbnail replacement."
+        )
+        return
+    if not ffmpeg_available():
+        await copy_without_thumb("ffmpeg is not installed on the bot's machine.")
+        return
+
+    note = await message.reply_text("⏳ Downloading… 0%")
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=DOWNLOAD_DIR) as tmp:
+        ext = os.path.splitext(video.file_name or "")[1] or ".mp4"
+        src = os.path.join(tmp, "in" + ext)
+        out = os.path.join(tmp, "out.mp4")
+        try:
+            await message.download(file_name=src, progress=ProgressReporter(note, "Downloading"))
+        except RPCError as e:
+            await note.delete()
+            await copy_without_thumb(f"Telegram wouldn't let me download the file ({e}).")
+            return
+
+        await note.edit_text("⏳ Embedding thumbnail…")
+        upload_path = src
+        loop = asyncio.get_running_loop()
+        embedded = await loop.run_in_executor(None, attach_thumbnail, src, cfg["thumb_path"], out)
+        if embedded:
+            upload_path = out
+        # embedding can fail on exotic containers; the send_video `thumb` argument
+        # below still sets the visible Telegram thumbnail either way
+
+        if os.path.getsize(upload_path) > MAX_FILE_SIZE:
+            await note.delete()
+            await copy_without_thumb("the result exceeds Telegram's upload limit.")
+            return
+
         await client.send_video(
             chat_id=target,
-            video=video.file_id,
+            video=upload_path,
             caption=caption,
             thumb=cfg["thumb_path"],
             duration=video.duration or 0,
             width=video.width or 0,
             height=video.height or 0,
             supports_streaming=True,
+            progress=ProgressReporter(note, "Uploading"),
         )
-        await message.reply_text(f"✅ Posted to {cfg['target_title']} with the new thumbnail.")
-    except RPCError as e:
-        # file_id reuse can fail if Telegram's file reference expired; fall
-        # back to a plain copy so the post still goes through
-        await client.copy_message(
-            chat_id=target, from_chat_id=message.chat.id,
-            message_id=message.id, caption=caption,
-        )
-        await message.reply_text(
-            f"⚠️ Posted to {cfg['target_title']} with the original thumbnail "
-            f"(couldn't reuse the file for a thumbnail swap: {e})."
-        )
+    await note.delete()
+    extra = "" if embedded else " (thumbnail set via Telegram; embedding in the file itself failed)"
+    await message.reply_text(f"✅ Posted to {cfg['target_title']} with the new thumbnail.{extra}")
 
 
 def main() -> None:
