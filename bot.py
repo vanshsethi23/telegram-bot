@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Telegram media repost bot.
+"""Telegram media repost bot (Pyrogram / MTProto).
 
 Forward a video/photo/document to the bot and it will:
   1. strip your configured keywords from the caption (case-insensitive),
   2. add your replacement text (append/prepend/replace),
   3. optionally attach a new thumbnail to videos (ffmpeg stream-copy, no transcode),
   4. post the result to your configured target channel.
+
+Uses Pyrogram (MTProto) instead of the plain Bot API so file transfers are not
+capped at the Bot API's 20 MB download / 50 MB upload limits - files up to
+Telegram's own ~2 GB limit work directly.
 
 Config is stored per-user in config.json next to this file.
 """
@@ -19,16 +23,9 @@ import shutil
 import subprocess
 import tempfile
 
-from telegram import Message, Update
-from telegram.constants import ChatMemberStatus
-from telegram.error import BadRequest, Forbidden, TelegramError
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
+from pyrogram import Client, enums, filters
+from pyrogram.errors import RPCError
+from pyrogram.types import Message
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 log = logging.getLogger("repost-bot")
@@ -36,10 +33,10 @@ log = logging.getLogger("repost-bot")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 THUMB_DIR = os.path.join(BASE_DIR, "thumbnails")
+DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
 
 CAPTION_LIMIT = 1024  # Telegram caption limit (chars)
-BOT_DOWNLOAD_LIMIT = 20 * 1024 * 1024  # Bot API can't download files > 20 MB
-BOT_UPLOAD_LIMIT = 50 * 1024 * 1024  # Bot API can't upload files > 50 MB
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # Telegram's own upload ceiling (2 GB, non-premium)
 THUMB_MAX_SIDE = 320  # Telegram thumbnail requirement
 
 VALID_MODES = ("append", "prepend", "replace")
@@ -63,6 +60,7 @@ def save_config(cfg: dict) -> None:
 
 
 CONFIG = load_config()
+AWAITING_THUMB = set()  # user ids that just ran /setthumb and need to send a photo
 
 
 def user_cfg(user_id: int) -> dict:
@@ -82,12 +80,11 @@ def user_cfg(user_id: int) -> dict:
 # ------------------------------------------------------------ caption editing
 
 
-def clean_caption(caption: str, keywords: list[str]) -> str:
+def clean_caption(caption: str, keywords: list) -> str:
     text = caption
     for kw in keywords:
         if kw:
             text = re.sub(re.escape(kw), "", text, flags=re.IGNORECASE)
-    # tidy up leftover whitespace
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r" +\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -125,7 +122,7 @@ def attach_thumbnail(video_path: str, thumb_path: str, out_path: str) -> bool:
         out_path,
     ]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     except (subprocess.TimeoutExpired, OSError) as e:
         log.warning("ffmpeg failed: %s", e)
         return False
@@ -152,7 +149,7 @@ def make_telegram_thumb(src_path: str, out_path: str) -> bool:
     return res.returncode == 0 and os.path.exists(out_path)
 
 
-# ----------------------------------------------------------------- commands
+# ----------------------------------------------------------------- helpers
 
 HELP_TEXT = (
     "Forward me a video/photo/document and I'll clean its caption and repost it "
@@ -168,92 +165,38 @@ HELP_TEXT = (
     "/setthumb — then send a photo (or send a photo with caption /setthumb) "
     "to use as thumbnail for videos\n"
     "/clearthumb — stop replacing video thumbnails\n"
-    "/status — show current configuration"
+    "/status — show current configuration\n\n"
+    "Files up to Telegram's own ~2 GB limit are supported."
 )
 
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(HELP_TEXT)
+def command_arg(message: Message) -> str:
+    parts = message.text.split(None, 1)
+    return parts[1].strip() if len(parts) > 1 else ""
 
 
-async def cmd_setkeywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg = user_cfg(update.effective_user.id)
-    raw = update.message.text.partition(" ")[2]
-    keywords = [k.strip() for k in raw.split(",") if k.strip()]
-    if not keywords:
-        await update.message.reply_text(
-            "Usage: /setkeywords word1, word2, some phrase"
-        )
-        return
-    cfg["keywords"] = keywords
-    save_config(CONFIG)
-    await update.message.reply_text(
-        "Keywords to remove:\n" + "\n".join(f"• {k}" for k in keywords)
-    )
-
-
-async def cmd_clearkeywords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg = user_cfg(update.effective_user.id)
-    cfg["keywords"] = []
-    save_config(CONFIG)
-    await update.message.reply_text("Keyword list cleared.")
-
-
-async def cmd_setcaption(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg = user_cfg(update.effective_user.id)
-    text = update.message.text.partition(" ")[2].strip()
-    if not text:
-        await update.message.reply_text("Usage: /setcaption Your replacement text")
-        return
-    cfg["replacement"] = text
-    save_config(CONFIG)
-    await update.message.reply_text(f"Replacement text set:\n{text}")
-
-
-async def cmd_clearcaption(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg = user_cfg(update.effective_user.id)
-    cfg["replacement"] = ""
-    save_config(CONFIG)
-    await update.message.reply_text("Replacement text cleared.")
-
-
-async def cmd_setmode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg = user_cfg(update.effective_user.id)
-    mode = update.message.text.partition(" ")[2].strip().lower()
-    if mode not in VALID_MODES:
-        await update.message.reply_text(
-            "Usage: /setmode append|prepend|replace\n"
-            "append — cleaned caption, then your text\n"
-            "prepend — your text, then cleaned caption\n"
-            "replace — only your text"
-        )
-        return
-    cfg["mode"] = mode
-    save_config(CONFIG)
-    await update.message.reply_text(f"Caption mode: {mode}")
-
-
-async def _verify_admin(bot, chat_id) -> tuple[bool, str]:
+async def verify_admin(app: Client, chat_id) -> tuple:
     """Return (ok, error_message)."""
     try:
-        chat = await bot.get_chat(chat_id)
-        member = await bot.get_chat_member(chat.id, bot.id)
-    except Forbidden:
+        chat = await app.get_chat(chat_id)
+        member = await app.get_chat_member(chat.id, "me")
+    except RPCError as e:
         return False, (
-            "I can't access that chat. Add me to the channel as an administrator "
-            "with the 'Post messages' right, then try again."
+            f"Couldn't access that chat ({e.MESSAGE if hasattr(e, 'MESSAGE') else e}). "
+            "Check the @username / id, and make sure I've been added to the channel "
+            "as an administrator."
         )
-    except BadRequest as e:
-        return False, (
-            f"Couldn't find that chat ({e.message}). Check the @username / id, and make "
-            "sure I've been added to the channel as an administrator."
-        )
-    if member.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+    if member.status not in (enums.ChatMemberStatus.ADMINISTRATOR, enums.ChatMemberStatus.OWNER):
         return False, (
             f"I'm in “{chat.title}” but I'm not an administrator there. "
             "Promote me with the 'Post messages' right, then run /settarget again."
         )
-    if member.status == ChatMemberStatus.ADMINISTRATOR and not member.can_post_messages:
+    privileges = member.privileges
+    if (
+        member.status == enums.ChatMemberStatus.ADMINISTRATOR
+        and privileges is not None
+        and not privileges.can_post_messages
+    ):
         return False, (
             f"I'm an admin in “{chat.title}” but I don't have the "
             "'Post messages' right. Enable it, then run /settarget again."
@@ -261,94 +204,14 @@ async def _verify_admin(bot, chat_id) -> tuple[bool, str]:
     return True, ""
 
 
-async def cmd_settarget(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg = user_cfg(update.effective_user.id)
-    arg = update.message.text.partition(" ")[2].strip()
-    if not arg:
-        await update.message.reply_text(
-            "Usage: /settarget @channelusername or /settarget -1001234567890"
-        )
-        return
-
-    # normalize t.me links
-    m = re.match(r"(?:https?://)?t\.me/(.+)", arg)
-    if m:
-        arg = m.group(1).strip("/")
-        if arg.startswith("+") or arg.startswith("joinchat"):
-            await update.message.reply_text(
-                "That's a private invite link — bots can't join channels via invite "
-                "links. Add me to the channel as an admin yourself, then send "
-                "/settarget with the channel's @username, or (for private channels) "
-                "its numeric id like -1001234567890.\n"
-                "Tip: forward any post from the channel to @userinfobot to get the id."
-            )
-            return
-
-    if re.fullmatch(r"-?\d+", arg):
-        target = int(arg)
-    else:
-        target = arg if arg.startswith("@") else "@" + arg
-
-    ok, err = await _verify_admin(context.bot, target)
-    if not ok:
-        await update.message.reply_text(f"❌ {err}")
-        return
-
-    chat = await context.bot.get_chat(target)
-    cfg["target_chat_id"] = chat.id
-    cfg["target_title"] = chat.title or str(target)
-    save_config(CONFIG)
-    await update.message.reply_text(
-        f"✅ Target channel set: {cfg['target_title']} (id {chat.id}). "
-        "I verified that I'm an admin and can post there."
-    )
-
-
-async def cmd_setthumb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # /setthumb as a reply to a photo works immediately
-    reply = update.message.reply_to_message
-    if reply and reply.photo:
-        await _store_thumbnail(update.message, reply, context)
-        return
-    context.user_data["awaiting_thumb"] = True
-    await update.message.reply_text(
-        "Send me the photo to use as the new video thumbnail."
-    )
-
-
-async def cmd_clearthumb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg = user_cfg(update.effective_user.id)
-    if cfg.get("thumb_path") and os.path.exists(cfg["thumb_path"]):
-        os.remove(cfg["thumb_path"])
-    cfg["thumb_path"] = None
-    save_config(CONFIG)
-    await update.message.reply_text("Thumbnail cleared — videos keep their own thumbnail.")
-
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg = user_cfg(update.effective_user.id)
-    kw = ", ".join(cfg["keywords"]) or "(none)"
-    await update.message.reply_text(
-        f"Keywords to remove: {kw}\n"
-        f"Replacement text: {cfg['replacement'] or '(none)'}\n"
-        f"Caption mode: {cfg.get('mode', 'append')}\n"
-        f"Target channel: {cfg['target_title'] or '(not set)'}\n"
-        f"Custom thumbnail: {'set' if cfg.get('thumb_path') else '(none)'}\n"
-        f"ffmpeg: {'available' if ffmpeg_available() else 'NOT FOUND (thumbnail embedding disabled)'}"
-    )
-
-
-async def _store_thumbnail(
-    status_msg: Message, photo_msg: Message, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    cfg = user_cfg(photo_msg.from_user.id if photo_msg.from_user else status_msg.chat_id)
+async def store_thumbnail(status_msg: Message, photo_msg: Message, app: Client) -> None:
+    user_id = photo_msg.from_user.id if photo_msg.from_user else status_msg.chat.id
+    cfg = user_cfg(user_id)
     os.makedirs(THUMB_DIR, exist_ok=True)
-    photo = photo_msg.photo[-1]
-    tg_file = await photo.get_file()
     with tempfile.TemporaryDirectory() as tmp:
         raw = os.path.join(tmp, "raw.jpg")
-        await tg_file.download_to_drive(raw)
-        dest = os.path.join(THUMB_DIR, f"{status_msg.chat_id}.jpg")
+        await photo_msg.download(file_name=raw)
+        dest = os.path.join(THUMB_DIR, f"{status_msg.chat.id}.jpg")
         if ffmpeg_available():
             if not make_telegram_thumb(raw, dest):
                 await status_msg.reply_text("❌ Couldn't process that image, try another one.")
@@ -362,167 +225,275 @@ async def _store_thumbnail(
     )
 
 
-# ------------------------------------------------------------- media handler
+# ----------------------------------------------------------------- app setup
 
 
-async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.message
-    user_id = update.effective_user.id
-    cfg = user_cfg(user_id)
-
-    # photo sent right after /setthumb (or with /setthumb as caption) sets the thumbnail
-    if msg.photo and (
-        context.user_data.pop("awaiting_thumb", False)
-        or (msg.caption or "").strip().lower().startswith("/setthumb")
-    ):
-        await _store_thumbnail(msg, msg, context)
-        return
-
-    if not cfg["target_chat_id"]:
-        await msg.reply_text("No target channel configured. Use /settarget first.")
-        return
-
-    ok, err = await _verify_admin(context.bot, cfg["target_chat_id"])
-    if not ok:
-        await msg.reply_text(f"❌ Can't post to {cfg['target_title']}: {err}")
-        return
-
-    final_caption = build_caption(msg.caption or "", cfg)
-
-    try:
-        if msg.video and cfg.get("thumb_path"):
-            await _repost_video_with_thumb(msg, cfg, final_caption, context)
-        else:
-            await context.bot.copy_message(
-                chat_id=cfg["target_chat_id"],
-                from_chat_id=msg.chat_id,
-                message_id=msg.message_id,
-                caption=final_caption,
-            )
-            await msg.reply_text(f"✅ Posted to {cfg['target_title']}.")
-    except Forbidden:
-        await msg.reply_text(
-            f"❌ Posting failed: I've lost posting rights in {cfg['target_title']}. "
-            "Make sure I'm still an admin with 'Post messages'."
+def build_app() -> Client:
+    api_id = os.environ.get("API_ID")
+    api_hash = os.environ.get("API_HASH")
+    bot_token = os.environ.get("BOT_TOKEN")
+    if not (api_id and api_hash and bot_token):
+        raise SystemExit(
+            "Set API_ID, API_HASH (from https://my.telegram.org) and BOT_TOKEN "
+            "(from @BotFather) environment variables."
         )
-    except BadRequest as e:
-        await msg.reply_text(f"❌ Telegram rejected the post: {e.message}")
-    except TelegramError as e:
-        await msg.reply_text(f"❌ Telegram error: {e}")
+    if not ffmpeg_available():
+        log.warning("ffmpeg not found — thumbnail embedding will be skipped.")
+
+    app = Client(
+        "repost_bot_session",
+        api_id=int(api_id),
+        api_hash=api_hash,
+        bot_token=bot_token,
+        workdir=BASE_DIR,
+    )
+
+    @app.on_message(filters.command(["start", "help"]) & filters.private)
+    async def cmd_start(_, message: Message):
+        await message.reply_text(HELP_TEXT)
+
+    @app.on_message(filters.command("setkeywords") & filters.private)
+    async def cmd_setkeywords(_, message: Message):
+        cfg = user_cfg(message.from_user.id)
+        raw = command_arg(message)
+        keywords = [k.strip() for k in raw.split(",") if k.strip()]
+        if not keywords:
+            await message.reply_text("Usage: /setkeywords word1, word2, some phrase")
+            return
+        cfg["keywords"] = keywords
+        save_config(CONFIG)
+        await message.reply_text("Keywords to remove:\n" + "\n".join(f"• {k}" for k in keywords))
+
+    @app.on_message(filters.command("clearkeywords") & filters.private)
+    async def cmd_clearkeywords(_, message: Message):
+        cfg = user_cfg(message.from_user.id)
+        cfg["keywords"] = []
+        save_config(CONFIG)
+        await message.reply_text("Keyword list cleared.")
+
+    @app.on_message(filters.command("setcaption") & filters.private)
+    async def cmd_setcaption(_, message: Message):
+        cfg = user_cfg(message.from_user.id)
+        text = command_arg(message)
+        if not text:
+            await message.reply_text("Usage: /setcaption Your replacement text")
+            return
+        cfg["replacement"] = text
+        save_config(CONFIG)
+        await message.reply_text(f"Replacement text set:\n{text}")
+
+    @app.on_message(filters.command("clearcaption") & filters.private)
+    async def cmd_clearcaption(_, message: Message):
+        cfg = user_cfg(message.from_user.id)
+        cfg["replacement"] = ""
+        save_config(CONFIG)
+        await message.reply_text("Replacement text cleared.")
+
+    @app.on_message(filters.command("setmode") & filters.private)
+    async def cmd_setmode(_, message: Message):
+        cfg = user_cfg(message.from_user.id)
+        mode = command_arg(message).lower()
+        if mode not in VALID_MODES:
+            await message.reply_text(
+                "Usage: /setmode append|prepend|replace\n"
+                "append — cleaned caption, then your text\n"
+                "prepend — your text, then cleaned caption\n"
+                "replace — only your text"
+            )
+            return
+        cfg["mode"] = mode
+        save_config(CONFIG)
+        await message.reply_text(f"Caption mode: {mode}")
+
+    @app.on_message(filters.command("settarget") & filters.private)
+    async def cmd_settarget(client: Client, message: Message):
+        cfg = user_cfg(message.from_user.id)
+        arg = command_arg(message)
+        if not arg:
+            await message.reply_text(
+                "Usage: /settarget @channelusername or /settarget -1001234567890"
+            )
+            return
+
+        m = re.match(r"(?:https?://)?t\.me/(.+)", arg)
+        if m:
+            arg = m.group(1).strip("/")
+            if arg.startswith("+") or arg.startswith("joinchat"):
+                await message.reply_text(
+                    "That's a private invite link — bots can't join channels via invite "
+                    "links. Add me to the channel as an admin yourself, then send "
+                    "/settarget with the channel's @username, or (for private channels) "
+                    "its numeric id like -1001234567890.\n"
+                    "Tip: forward any post from the channel to @userinfobot to get the id."
+                )
+                return
+
+        target = int(arg) if re.fullmatch(r"-?\d+", arg) else (arg if arg.startswith("@") else "@" + arg)
+
+        ok, err = await verify_admin(client, target)
+        if not ok:
+            await message.reply_text(f"❌ {err}")
+            return
+
+        chat = await client.get_chat(target)
+        cfg["target_chat_id"] = chat.id
+        cfg["target_title"] = chat.title or str(target)
+        save_config(CONFIG)
+        await message.reply_text(
+            f"✅ Target channel set: {cfg['target_title']} (id {chat.id}). "
+            "I verified that I'm an admin and can post there."
+        )
+
+    @app.on_message(filters.command("setthumb") & filters.private)
+    async def cmd_setthumb(client: Client, message: Message):
+        reply = message.reply_to_message
+        if reply and reply.photo:
+            await store_thumbnail(message, reply, client)
+            return
+        AWAITING_THUMB.add(message.from_user.id)
+        await message.reply_text("Send me the photo to use as the new video thumbnail.")
+
+    @app.on_message(filters.command("clearthumb") & filters.private)
+    async def cmd_clearthumb(_, message: Message):
+        cfg = user_cfg(message.from_user.id)
+        if cfg.get("thumb_path") and os.path.exists(cfg["thumb_path"]):
+            os.remove(cfg["thumb_path"])
+        cfg["thumb_path"] = None
+        save_config(CONFIG)
+        await message.reply_text("Thumbnail cleared — videos keep their own thumbnail.")
+
+    @app.on_message(filters.command("status") & filters.private)
+    async def cmd_status(_, message: Message):
+        cfg = user_cfg(message.from_user.id)
+        kw = ", ".join(cfg["keywords"]) or "(none)"
+        await message.reply_text(
+            f"Keywords to remove: {kw}\n"
+            f"Replacement text: {cfg['replacement'] or '(none)'}\n"
+            f"Caption mode: {cfg.get('mode', 'append')}\n"
+            f"Target channel: {cfg['target_title'] or '(not set)'}\n"
+            f"Custom thumbnail: {'set' if cfg.get('thumb_path') else '(none)'}\n"
+            f"ffmpeg: {'available' if ffmpeg_available() else 'NOT FOUND (thumbnail embedding disabled)'}"
+        )
+
+    @app.on_message(
+        filters.private & (filters.video | filters.photo | filters.document | filters.animation)
+    )
+    async def handle_media(client: Client, message: Message):
+        if message.photo and (
+            message.from_user.id in AWAITING_THUMB
+            or (message.caption or "").strip().lower().startswith("/setthumb")
+        ):
+            AWAITING_THUMB.discard(message.from_user.id)
+            await store_thumbnail(message, message, client)
+            return
+
+        cfg = user_cfg(message.from_user.id)
+        if not cfg["target_chat_id"]:
+            await message.reply_text("No target channel configured. Use /settarget first.")
+            return
+
+        ok, err = await verify_admin(client, cfg["target_chat_id"])
+        if not ok:
+            await message.reply_text(f"❌ Can't post to {cfg['target_title']}: {err}")
+            return
+
+        final_caption = build_caption(message.caption or "", cfg)
+
+        try:
+            if message.video and cfg.get("thumb_path"):
+                await repost_video_with_thumb(client, message, cfg, final_caption)
+            else:
+                await client.copy_message(
+                    chat_id=cfg["target_chat_id"],
+                    from_chat_id=message.chat.id,
+                    message_id=message.id,
+                    caption=final_caption,
+                )
+                await message.reply_text(f"✅ Posted to {cfg['target_title']}.")
+        except RPCError as e:
+            await message.reply_text(f"❌ Telegram rejected the post: {e}")
+
+    @app.on_message(filters.private & filters.text & ~filters.command([
+        "start", "help", "setkeywords", "clearkeywords", "setcaption", "clearcaption",
+        "setmode", "settarget", "setthumb", "clearthumb", "status",
+    ]))
+    async def handle_other(_, message: Message):
+        await message.reply_text("Send me a video, photo or document to repost, or /help for commands.")
+
+    return app
 
 
-async def _repost_video_with_thumb(
-    msg: Message, cfg: dict, caption: str, context: ContextTypes.DEFAULT_TYPE
+async def repost_video_with_thumb(
+    client: Client, message: Message, cfg: dict, caption: str
 ) -> None:
     """Download video, embed the configured thumbnail without transcoding, upload."""
-    video = msg.video
+    video = message.video
     target = cfg["target_chat_id"]
 
     async def copy_without_thumb(reason: str) -> None:
-        await context.bot.copy_message(
-            chat_id=target, from_chat_id=msg.chat_id,
-            message_id=msg.message_id, caption=caption,
+        await client.copy_message(
+            chat_id=target, from_chat_id=message.chat.id,
+            message_id=message.id, caption=caption,
         )
-        await msg.reply_text(
+        await message.reply_text(
             f"⚠️ Posted to {cfg['target_title']} with the original thumbnail: {reason}"
         )
 
-    if video.file_size and video.file_size > BOT_DOWNLOAD_LIMIT:
+    if video.file_size and video.file_size > MAX_FILE_SIZE:
         await copy_without_thumb(
-            "the Bot API only lets bots download files up to 20 MB, so I can't "
-            f"re-upload this {video.file_size / 1024 / 1024:.0f} MB video with a new thumbnail."
+            f"this {video.file_size / 1024 / 1024:.0f} MB video exceeds Telegram's "
+            "own upload limit for thumbnail replacement."
         )
         return
     if not ffmpeg_available():
         await copy_without_thumb("ffmpeg is not installed on the bot's machine.")
         return
 
-    note = await msg.reply_text("⏳ Replacing thumbnail and uploading…")
-    with tempfile.TemporaryDirectory() as tmp:
+    note = await message.reply_text("⏳ Downloading, replacing thumbnail and uploading…")
+    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=DOWNLOAD_DIR) as tmp:
         ext = os.path.splitext(video.file_name or "")[1] or ".mp4"
         src = os.path.join(tmp, "in" + ext)
         out = os.path.join(tmp, "out.mp4")
         try:
-            tg_file = await video.get_file()
-            await tg_file.download_to_drive(src)
-        except BadRequest as e:
+            await message.download(file_name=src)
+        except RPCError as e:
             await note.delete()
-            await copy_without_thumb(f"Telegram wouldn't let me download the file ({e.message}).")
+            await copy_without_thumb(f"Telegram wouldn't let me download the file ({e}).")
             return
 
         upload_path = src
         loop = asyncio.get_running_loop()
-        embedded = await loop.run_in_executor(
-            None, attach_thumbnail, src, cfg["thumb_path"], out
-        )
+        embedded = await loop.run_in_executor(None, attach_thumbnail, src, cfg["thumb_path"], out)
         if embedded:
             upload_path = out
-        # embedding can fail on exotic containers; the send_video `thumbnail`
-        # parameter below still sets the visible Telegram thumbnail either way
+        # embedding can fail on exotic containers; the send_video `thumb` argument
+        # below still sets the visible Telegram thumbnail either way
 
-        if os.path.getsize(upload_path) > BOT_UPLOAD_LIMIT:
+        if os.path.getsize(upload_path) > MAX_FILE_SIZE:
             await note.delete()
-            await copy_without_thumb(
-                "the result exceeds the Bot API's 50 MB upload limit."
-            )
+            await copy_without_thumb("the result exceeds Telegram's upload limit.")
             return
 
-        with open(upload_path, "rb") as vf, open(cfg["thumb_path"], "rb") as tf:
-            await context.bot.send_video(
-                chat_id=target,
-                video=vf,
-                caption=caption,
-                thumbnail=tf,
-                duration=video.duration,
-                width=video.width,
-                height=video.height,
-                supports_streaming=True,
-                read_timeout=300,
-                write_timeout=300,
-            )
+        await client.send_video(
+            chat_id=target,
+            video=upload_path,
+            caption=caption,
+            thumb=cfg["thumb_path"],
+            duration=video.duration or 0,
+            width=video.width or 0,
+            height=video.height or 0,
+            supports_streaming=True,
+        )
     await note.delete()
     extra = "" if embedded else " (thumbnail set via Telegram; embedding in the file itself failed)"
-    await msg.reply_text(f"✅ Posted to {cfg['target_title']} with the new thumbnail.{extra}")
-
-
-async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.message:
-        await update.message.reply_text(
-            "Send me a video, photo or document to repost, or /help for commands."
-        )
+    await message.reply_text(f"✅ Posted to {cfg['target_title']} with the new thumbnail.{extra}")
 
 
 def main() -> None:
-    token = os.environ.get("BOT_TOKEN")
-    if not token:
-        raise SystemExit("Set the BOT_TOKEN environment variable (get one from @BotFather).")
-    if not ffmpeg_available():
-        log.warning("ffmpeg not found — thumbnail embedding will be skipped.")
-
-    app = Application.builder().token(token).build()
-    app.add_handler(CommandHandler(["start", "help"], cmd_start))
-    app.add_handler(CommandHandler("setkeywords", cmd_setkeywords))
-    app.add_handler(CommandHandler("clearkeywords", cmd_clearkeywords))
-    app.add_handler(CommandHandler("setcaption", cmd_setcaption))
-    app.add_handler(CommandHandler("clearcaption", cmd_clearcaption))
-    app.add_handler(CommandHandler("setmode", cmd_setmode))
-    app.add_handler(CommandHandler("settarget", cmd_settarget))
-    app.add_handler(CommandHandler("setthumb", cmd_setthumb))
-    app.add_handler(CommandHandler("clearthumb", cmd_clearthumb))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(
-        MessageHandler(
-            (filters.VIDEO | filters.PHOTO | filters.Document.ALL | filters.ANIMATION)
-            & filters.ChatType.PRIVATE,
-            handle_media,
-        )
-    )
-    app.add_handler(
-        MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, handle_other)
-    )
-
-    log.info("Bot starting (polling)…")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app = build_app()
+    log.info("Bot starting…")
+    app.run()
 
 
 if __name__ == "__main__":

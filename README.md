@@ -9,28 +9,45 @@ Forward a video/photo/document to this bot and it automatically:
 
 ## Setup
 
+This bot uses Pyrogram (MTProto) instead of the plain Bot API so file transfers
+aren't capped at the Bot API's 20 MB download / 50 MB upload limits — files up
+to Telegram's own ~2 GB limit work directly. This means you need **both** a bot
+token and an `api_id`/`api_hash` pair.
+
 1. Create a bot with [@BotFather](https://t.me/BotFather) and copy the token.
-2. Install dependencies (Python 3.10+):
+2. Get an `api_id` and `api_hash` from <https://my.telegram.org> → **API
+   development tools** (free, just needs your phone number — this identifies
+   the *application*, not a user account; the bot still logs in with its own
+   token).
+3. Install dependencies (Python 3.10+):
 
    ```bash
    pip install -r requirements.txt
    ```
 
-3. Install ffmpeg (needed only for thumbnail replacement):
+   If installing fails with a `pyaes` wheel-build error, retry with:
+   ```bash
+   SETUPTOOLS_USE_DISTUTILS=stdlib pip install -r requirements.txt
+   ```
+
+4. Install ffmpeg (needed only for thumbnail replacement):
 
    ```bash
    sudo apt install ffmpeg      # Debian/Ubuntu
    brew install ffmpeg          # macOS
    ```
 
-4. Add the bot to your target channel as an **administrator** with the
+5. Add the bot to your target channel as an **administrator** with the
    **Post messages** right.
 
-5. Run it:
+6. Run it:
 
    ```bash
-   BOT_TOKEN=123456:ABC-your-token python3 bot.py
+   API_ID=12345 API_HASH=abcdef0123456789abcdef0123456789 BOT_TOKEN=123456:ABC-your-token python3 bot.py
    ```
+
+   First run creates a `repost_bot_session.session` file next to `bot.py` —
+   keep it, it lets the bot reconnect without re-authenticating.
 
 ## Configure (in a private chat with the bot)
 
@@ -54,10 +71,11 @@ so it survives restarts.
 - **Private channels:** bots can't join via invite links. Add the bot as admin
   yourself, then use the channel's numeric id (`-100...`) with `/settarget`
   (forward a post from the channel to @userinfobot to find the id).
-- **Thumbnail replacement** requires downloading and re-uploading the video, so
-  Bot API limits apply: download ≤ 20 MB, upload ≤ 50 MB. Larger videos are
-  reposted with their original thumbnail and the bot tells you why.
-  Without a custom thumbnail there is no size limit at all — the bot uses
-  `copyMessage`, which never downloads the file.
+- **Thumbnail replacement** requires downloading and re-uploading the video.
+  Since the bot talks MTProto directly (not the restricted Bot API), this works
+  up to Telegram's own ~2 GB upload ceiling. Larger videos are reposted with
+  their original thumbnail and the bot tells you why.
+  Without a custom thumbnail there is no size limit concern at all — the bot
+  uses `copy_message`, which never downloads the file.
 - Thumbnails are auto-converted to Telegram's requirements (JPEG, ≤ 320 px).
 - Captions are truncated to Telegram's 1024-character limit.

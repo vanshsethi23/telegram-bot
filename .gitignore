@@ -1,4 +1,7 @@
 __pycache__/
 config.json
 thumbnails/
+downloads/
+*.session
+*.session-journal
 .env
