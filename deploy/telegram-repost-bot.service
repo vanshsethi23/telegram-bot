@@ -1,0 +1,28 @@
+# systemd unit for the Telegram media repost bot.
+#
+# 1. Copy to /etc/systemd/system/:  sudo cp deploy/telegram-repost-bot.service /etc/systemd/system/
+# 2. Edit the three Environment= lines below with your real values:
+#    sudo nano /etc/systemd/system/telegram-repost-bot.service
+# 3. Enable + start:
+#    sudo systemctl daemon-reload
+#    sudo systemctl enable --now telegram-repost-bot
+# 4. Watch logs:  journalctl -u telegram-repost-bot -f
+
+[Unit]
+Description=Telegram media repost bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/telegram-bot
+Environment=API_ID=CHANGE_ME
+Environment=API_HASH=CHANGE_ME
+Environment=BOT_TOKEN=CHANGE_ME
+ExecStart=/home/ubuntu/telegram-bot/venv/bin/python3 /home/ubuntu/telegram-bot/bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -66,6 +66,28 @@ Then just **forward media to the bot** — it reposts to the channel automatical
 Config is persisted in `config.json` (and `thumbnails/`) next to `bot.py`,
 so it survives restarts.
 
+## Running 24/7 on a server
+
+A systemd unit template is included in `deploy/telegram-repost-bot.service` —
+it auto-starts the bot on boot and restarts it on crashes. On a fresh Ubuntu
+server:
+
+```bash
+sudo apt update && sudo apt install -y python3-venv ffmpeg git
+git clone https://github.com/vanshsethi23/telegram-bot.git ~/telegram-bot
+cd ~/telegram-bot
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
+sudo cp deploy/telegram-repost-bot.service /etc/systemd/system/
+sudo nano /etc/systemd/system/telegram-repost-bot.service   # fill in API_ID/API_HASH/BOT_TOKEN
+sudo systemctl daemon-reload
+sudo systemctl enable --now telegram-repost-bot
+journalctl -u telegram-repost-bot -f    # watch logs
+```
+
+Only run ONE copy of the bot at a time (server OR laptop, never both) —
+two processes sharing a bot token fight over updates and both misbehave.
+
 ## Notes & limits
 
 - **Private channels:** bots can't join via invite links. Add the bot as admin
