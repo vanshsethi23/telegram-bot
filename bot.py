@@ -36,6 +36,7 @@ THUMB_DIR = os.path.join(BASE_DIR, "thumbnails")
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
 
 CAPTION_LIMIT = 1024  # Telegram caption limit (chars)
+TEXT_LIMIT = 4096  # Telegram text message limit (chars)
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024  # Telegram's own upload ceiling (2 GB, non-premium)
 THUMB_MAX_SIDE = 320  # Telegram thumbnail requirement
 
@@ -116,7 +117,7 @@ def clean_caption(caption: str, keywords: list) -> str:
     return text.strip()
 
 
-def build_caption(original: str, cfg: dict) -> str:
+def build_caption(original: str, cfg: dict, limit: int = CAPTION_LIMIT) -> str:
     cleaned = clean_caption(original or "", cfg["keywords"])
     repl = cfg["replacement"]
     mode = cfg.get("mode", "append")
@@ -126,7 +127,7 @@ def build_caption(original: str, cfg: dict) -> str:
         final = "\n\n".join(p for p in (repl, cleaned) if p)
     else:  # append
         final = "\n\n".join(p for p in (cleaned, repl) if p)
-    return final[:CAPTION_LIMIT]
+    return final[:limit]
 
 
 # ------------------------------------------------------------------- ffmpeg
@@ -177,8 +178,8 @@ def make_telegram_thumb(src_path: str, out_path: str) -> bool:
 # ----------------------------------------------------------------- helpers
 
 HELP_TEXT = (
-    "Forward me a video/photo/document and I'll clean its caption and repost it "
-    "to your target channel.\n\n"
+    "Forward me a video/photo/document/text and I'll clean its caption (or text) "
+    "and repost it to your target channel.\n\n"
     "Configuration commands:\n"
     "/setkeywords word1, word2, ... — keywords to strip from captions\n"
     "/clearkeywords — remove all keywords\n"
@@ -423,18 +424,31 @@ def build_app() -> Client:
             )
         ensure_worker()
 
-    @app.on_message(filters.private & filters.text & ~filters.command([
+    @app.on_message(filters.private & filters.text & filters.forwarded)
+    async def handle_forwarded_text(client: Client, message: Message):
+        # forwarded text posts go through the same FIFO queue as media
+        REPOST_QUEUE.put_nowait((client, message))
+        if REPOST_QUEUE.qsize() > 1:
+            await message.reply_text(
+                f"🕐 Queued (position {REPOST_QUEUE.qsize()}) — posting in order."
+            )
+        ensure_worker()
+
+    @app.on_message(filters.private & filters.text & ~filters.forwarded & ~filters.command([
         "start", "help", "setkeywords", "clearkeywords", "setcaption", "clearcaption",
         "setmode", "settarget", "setthumb", "clearthumb", "status",
     ]))
     async def handle_other(_, message: Message):
-        await message.reply_text("Send me a video, photo or document to repost, or /help for commands.")
+        await message.reply_text(
+            "Send me a video, photo, document or a forwarded text to repost, "
+            "or /help for commands."
+        )
 
     return app
 
 
 async def process_repost(client: Client, message: Message) -> None:
-    """Repost one forwarded media message to the user's target channel."""
+    """Repost one forwarded media or text message to the user's target channel."""
     cfg = user_cfg(message.from_user.id)
     if not cfg["target_chat_id"]:
         await message.reply_text("No target channel configured. Use /settarget first.")
@@ -443,6 +457,20 @@ async def process_repost(client: Client, message: Message) -> None:
     ok, err = await verify_admin(client, cfg["target_chat_id"])
     if not ok:
         await message.reply_text(f"❌ Can't post to {cfg['target_title']}: {err}")
+        return
+
+    if message.text:
+        final_text = build_caption(message.text, cfg, limit=TEXT_LIMIT)
+        if not final_text:
+            await message.reply_text(
+                "Nothing left to post after keyword removal — skipped."
+            )
+            return
+        try:
+            await client.send_message(chat_id=cfg["target_chat_id"], text=final_text)
+            await message.reply_text(f"✅ Posted to {cfg['target_title']}.")
+        except RPCError as e:
+            await message.reply_text(f"❌ Telegram rejected the post: {e}")
         return
 
     final_caption = build_caption(message.caption or "", cfg)

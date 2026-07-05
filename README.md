@@ -1,8 +1,8 @@
 # Telegram Media Repost Bot
 
-Forward a video/photo/document to this bot and it automatically:
+Forward a video/photo/document (or a text message) to this bot and it automatically:
 
-1. strips your configured keywords from the caption (case-insensitive),
+1. strips your configured keywords from the caption or text (case-insensitive),
 2. adds your replacement text (append / prepend / replace),
 3. optionally replaces the video thumbnail (ffmpeg stream-copy — the video is **not** re-encoded),
 4. posts the result to your target channel. No manual step after forwarding.
@@ -61,7 +61,11 @@ token and an `api_id`/`api_hash` pair.
 | `/clearthumb`, `/clearkeywords`, `/clearcaption` | Clear the respective setting |
 | `/status` | Show current configuration |
 
-Then just **forward media to the bot** — it reposts to the channel automatically.
+Then just **forward media or text to the bot** — it reposts to the channel
+automatically. Forwarded text messages get the same keyword-cleanup and
+replacement treatment (up to Telegram's 4096-char text limit). Text you type
+directly to the bot is NOT reposted — only forwarded messages are — so you
+can talk to the bot without fear of posting to your channel by accident.
 
 Config is persisted in `config.json` (and `thumbnails/`) next to `bot.py`,
 so it survives restarts.
