@@ -246,6 +246,7 @@ def build_app() -> Client:
         api_hash=api_hash,
         bot_token=bot_token,
         workdir=BASE_DIR,
+        max_concurrent_transmissions=4,  # parallel chunks for large-file transfer speed
     )
 
     @app.on_message(filters.command(["start", "help"]) & filters.private)
@@ -423,6 +424,31 @@ def build_app() -> Client:
     return app
 
 
+class ProgressReporter:
+    """Throttled progress editor so long transfers show visible movement."""
+
+    def __init__(self, note: Message, label: str):
+        self.note = note
+        self.label = label
+        self._last_edit = 0.0
+        self._last_pct = -1
+
+    async def __call__(self, current: int, total: int) -> None:
+        pct = int(current * 100 / total) if total else 0
+        now = asyncio.get_running_loop().time()
+        if pct == self._last_pct or (now - self._last_edit < 4 and pct < 100):
+            return
+        self._last_edit = now
+        self._last_pct = pct
+        mb = lambda n: n / 1024 / 1024
+        try:
+            await self.note.edit_text(
+                f"⏳ {self.label}… {pct}% ({mb(current):.0f}/{mb(total):.0f} MB)"
+            )
+        except RPCError:
+            pass  # ignore flood-wait/edit races, the transfer itself is unaffected
+
+
 async def repost_video_with_thumb(
     client: Client, message: Message, cfg: dict, caption: str
 ) -> None:
@@ -449,19 +475,20 @@ async def repost_video_with_thumb(
         await copy_without_thumb("ffmpeg is not installed on the bot's machine.")
         return
 
-    note = await message.reply_text("⏳ Downloading, replacing thumbnail and uploading…")
+    note = await message.reply_text("⏳ Downloading… 0%")
     os.makedirs(DOWNLOAD_DIR, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=DOWNLOAD_DIR) as tmp:
         ext = os.path.splitext(video.file_name or "")[1] or ".mp4"
         src = os.path.join(tmp, "in" + ext)
         out = os.path.join(tmp, "out.mp4")
         try:
-            await message.download(file_name=src)
+            await message.download(file_name=src, progress=ProgressReporter(note, "Downloading"))
         except RPCError as e:
             await note.delete()
             await copy_without_thumb(f"Telegram wouldn't let me download the file ({e}).")
             return
 
+        await note.edit_text("⏳ Embedding thumbnail…")
         upload_path = src
         loop = asyncio.get_running_loop()
         embedded = await loop.run_in_executor(None, attach_thumbnail, src, cfg["thumb_path"], out)
@@ -484,6 +511,7 @@ async def repost_video_with_thumb(
             width=video.width or 0,
             height=video.height or 0,
             supports_streaming=True,
+            progress=ProgressReporter(note, "Uploading"),
         )
     await note.delete()
     extra = "" if embedded else " (thumbnail set via Telegram; embedding in the file itself failed)"
